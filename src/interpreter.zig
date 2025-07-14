@@ -1,107 +1,181 @@
 const std = @import("std");
-const jit = @import("jit.zig");
+const JitCompiler = @import("jit.zig").JitCompiler;
+const CompiledFunction = @import("jit.zig").CompiledFunction;
+const pthread = @cImport(@cInclude("pthread.h"));
 
-pub const Opcode = enum(u8) {
-    push,
-    add,
-    eq,
-    jump_nz,
-    jump,
-    load_var,
-    store_var,
+pub const OpCode = enum(u8) {
+    push, // pushes a value onto the stack
+    pushc, // pushes a constant onto the stack
+    pop, // pops a value from the stack
+    add, // pops two values from the stack and pushes the sum
+    eq, // pops two values from the stack and pushes 1 if they are equal, 0 otherwise
+    jmp, // jumps to a block
+    jmp_nz, // pops a value from the stack and jumps to a block if it is not zero
+    pushv, // pushes a variable's value onto the stack
+    stvar, // pops a value from the stack and stores it in a variable
 };
 
-/// Shorthand to convert an Opcode to a u8
-pub inline fn Op(op: Opcode) u8 {
-    return @intFromEnum(op);
+pub const Block = struct {
+    bytecode: []const u8,
+    constants: []const i64,
+    variables: []i64,
+    allocator: std.mem.Allocator,
+    execution_count: u32,
+    compiled_function: ?CompiledFunction,
+
+    pub fn init(allocator: std.mem.Allocator, bytecode: []const u8, constants: []const i64, initial_variables: []i64) !Block {
+        const variables = try allocator.alloc(i64, initial_variables.len);
+        // Copy initial values to variables
+        @memcpy(variables, initial_variables);
+
+        return Block{
+            .bytecode = bytecode,
+            .constants = constants,
+            .variables = variables,
+            .allocator = allocator,
+            .execution_count = 0,
+            .compiled_function = null,
+        };
+    }
+
+    pub fn deinit(self: *Block) void {
+        self.allocator.free(self.variables);
+        if (self.compiled_function) |*func| {
+            func.deinit();
+        }
+    }
+};
+
+pub fn Op(op_code: OpCode) u8 {
+    return @intFromEnum(op_code);
 }
 
-pub const CodeBlock = struct {
-    /// A list of `Opcode`s cast to u8
-    instructions: []const u8,
-    /// Constants used within this block
-    constants: []const i64,
-};
-
 pub const Interpreter = struct {
-    stack: [32_000]i64 = undefined,
-    stack_pos: u64 = 0,
-
     allocator: std.mem.Allocator,
+    blocks: []Block,
+    stack: []i64,
+    pc: u32,
+    sp: u32,
+    current_block: u32,
+    jit_compiler: JitCompiler,
+    jit_enabled: bool,
 
-    blocks: []const CodeBlock,
-    jit_blocks: []?jit.CompiledFunction,
-
-    current_block: *const CodeBlock = undefined,
-    pc: usize = 0,
-
-    jit_compiler: jit.JITCompiler,
-    is_jit_enabled: bool = false,
-
-    pub fn init(allocator: std.mem.Allocator, blocks: []const CodeBlock) !*Interpreter {
-        const self = try allocator.create(Interpreter);
-        self.* = Interpreter{
-            .blocks = blocks,
-            .current_block = &blocks[0],
-            .jit_compiler = jit.JITCompiler.init(allocator, self),
-            .jit_blocks = try allocator.alloc(?jit.CompiledFunction, blocks.len),
+    pub fn init(allocator: std.mem.Allocator, blocks: []Block, jit_enabled: bool) !Interpreter {
+        var interpreter = Interpreter{
             .allocator = allocator,
+            .blocks = blocks,
+            .stack = try allocator.alloc(i64, 132000),
+            .pc = 0,
+            .sp = 0,
+            .current_block = 0,
+            .jit_compiler = undefined,
+            .jit_enabled = jit_enabled,
         };
 
-        for (self.jit_blocks) |*jit_block| {
-            jit_block.* = null;
-        }
-
-        return self;
+        interpreter.jit_compiler = try JitCompiler.init(allocator, &interpreter);
+        return interpreter;
     }
 
-    pub fn deinit(self: *const Interpreter) void {
+    pub fn deinit(self: *Interpreter) void {
+        // for (self.blocks) |*block| {
+        //     block.deinit();
+        // }
         self.jit_compiler.deinit();
-
-        // unmap all the JIT functions
-        for (self.jit_blocks) |maybe_jit_block| {
-            if (maybe_jit_block) |*jit_block| {
-                jit_block.deinit();
-            }
-        }
-
-        self.allocator.free(self.jit_blocks);
-    }
-
-    inline fn loadConst(self: *Interpreter) i64 {
-        const index = self.current_block.instructions[self.pc];
-        const constant = self.current_block.constants[index];
-
-        self.pc += 1;
-        return constant;
-    }
-
-    inline fn top(self: *Interpreter) i64 {
-        return self.stack[self.stack_pos - 1];
-    }
-
-    inline fn pop(self: *Interpreter) i64 {
-        self.stack_pos -= 1;
-        return self.stack[self.stack_pos];
+        self.allocator.free(self.stack);
     }
 
     inline fn push(self: *Interpreter, value: i64) void {
-        self.stack[self.stack_pos] = value;
-        self.stack_pos += 1;
+        self.stack[self.sp] = value;
+        self.sp += 1;
     }
 
-    inline fn nextOp(self: *Interpreter) u8 {
-        const op = self.current_block.instructions[self.pc];
+    inline fn pop(self: *Interpreter) i64 {
+        self.sp -= 1;
+        return self.stack[self.sp];
+    }
+
+    pub inline fn top(self: *Interpreter) i64 {
+        return self.stack[self.sp - 1];
+    }
+
+    inline fn nextOpCode(self: *Interpreter) OpCode {
+        const op_code = @as(OpCode, @enumFromInt(self.blocks[self.current_block].bytecode[self.pc]));
         self.pc += 1;
-        return op;
+        return op_code;
+    }
+
+    inline fn loadConstant(self: *Interpreter) i64 {
+        const constant_index = self.blocks[self.current_block].bytecode[self.pc];
+        self.pc += 1;
+        if (constant_index >= self.blocks[self.current_block].constants.len) {
+            return 0;
+        }
+        return self.blocks[self.current_block].constants[constant_index];
     }
 
     pub fn run(self: *Interpreter) !void {
-        while (self.pc < self.current_block.instructions.len) {
-            const instr: Opcode = @enumFromInt(self.nextOp());
+        // Increment execution count for the initial block
+        self.blocks[self.current_block].execution_count += 1;
 
-            switch (instr) {
-                .push => self.push(self.loadConst()),
+        while (self.pc < self.blocks[self.current_block].bytecode.len) {
+            // Check if we should JIT compile this block
+            if (self.jit_enabled and
+                self.blocks[self.current_block].compiled_function == null and
+                self.blocks[self.current_block].execution_count >= 1000)
+            {
+                // Print professional JIT compilation notice
+
+                // Time the JIT compilation process
+                const compile_start = std.time.nanoTimestamp();
+                const compiled_func = try self.jit_compiler.compile(self.current_block, &self.blocks[self.current_block]);
+                const compile_end = std.time.nanoTimestamp();
+                const compile_time = @as(u64, @intCast(compile_end - compile_start));
+
+                self.blocks[self.current_block].compiled_function = compiled_func;
+
+                std.debug.print("⚡ JIT Compilation completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(compile_time)) / 1_000_000.0});
+            }
+
+            // If we have a compiled function, use it
+            if (self.blocks[self.current_block].compiled_function) |compiled_func| {
+                var pc_usize: usize = self.pc;
+                var sp_usize: usize = self.sp;
+                var current_block_usize: usize = self.current_block;
+
+                compiled_func.function(
+                    self.stack.ptr,
+                    self.blocks[self.current_block].bytecode.ptr,
+                    &pc_usize,
+                    &sp_usize,
+                    &current_block_usize,
+                    self.blocks[self.current_block].constants.ptr,
+                    self.blocks[self.current_block].variables.ptr,
+                );
+
+                self.pc = @intCast(pc_usize);
+                self.sp = @intCast(sp_usize);
+                self.current_block = @intCast(current_block_usize);
+
+                // If we jumped to a different block, continue from there
+                if (self.current_block >= self.blocks.len) return;
+                continue;
+            }
+
+            // Fallback to interpretation
+            const op_code = self.nextOpCode();
+            switch (op_code) {
+                .pushc => {
+                    const value = self.loadConstant();
+                    self.push(value);
+                },
+                .push => {
+                    const value = self.blocks[self.current_block].bytecode[self.pc];
+                    self.pc += 1;
+                    self.push(value);
+                },
+                .pop => {
+                    _ = self.pop();
+                },
                 .add => {
                     const a = self.pop();
                     const b = self.pop();
@@ -112,79 +186,200 @@ pub const Interpreter = struct {
                     const b = self.pop();
                     self.push(if (a == b) 1 else 0);
                 },
-
-                .jump => try self.jump(),
-                .jump_nz => {
-                    if (self.pop() != 0) {
-                        try self.jump();
-                    } else {
-                        self.pc += 1;
+                .jmp => {
+                    const block_index = self.blocks[self.current_block].bytecode[self.pc];
+                    self.pc += 1;
+                    if (block_index >= self.blocks.len) return;
+                    self.current_block = @intCast(block_index);
+                    self.pc = 0;
+                    // Increment execution count for the target block
+                    self.blocks[self.current_block].execution_count += 1;
+                    continue;
+                },
+                .jmp_nz => {
+                    const offset = self.blocks[self.current_block].bytecode[self.pc];
+                    self.pc += 1;
+                    if (self.top() != 0) {
+                        if (offset >= self.blocks.len) return;
+                        self.current_block = @intCast(offset);
+                        self.pc = 0;
+                        // Increment execution count for the target block
+                        self.blocks[self.current_block].execution_count += 1;
+                        continue;
                     }
                 },
-
-                .load_var => {
-                    const index = self.nextOp();
-                    self.push(self.stack[index]);
+                .pushv => {
+                    const variable_index = self.blocks[self.current_block].bytecode[self.pc];
+                    self.pc += 1;
+                    self.push(self.blocks[self.current_block].variables[@intCast(variable_index)]);
                 },
-
-                .store_var => {
-                    // [value, index]
-                    const index = self.nextOp();
-                    self.stack[index] = self.pop();
+                .stvar => {
+                    const variable_index = self.blocks[self.current_block].bytecode[self.pc];
+                    self.pc += 1;
+                    const value = self.pop();
+                    self.blocks[self.current_block].variables[@intCast(variable_index)] = value;
                 },
             }
         }
     }
-
-    /// Call a JIT compiled function
-    inline fn callJit(self: *Interpreter, compiled: *const jit.CompiledFunction) void {
-        var next_block_idx: usize = 0; // inout parameter for JITted function
-        compiled.func(
-            (&self.stack).ptr,
-            self.current_block.instructions.ptr,
-            &self.stack_pos,
-            &self.pc,
-            &next_block_idx,
-            self.current_block.constants.ptr,
-        );
-
-        self.current_block = &self.blocks[next_block_idx];
-        // self.pc = 0;
-    }
-
-    fn doJit(self: *Interpreter, block_index: usize) !void {
-        const block = &self.blocks[block_index];
-        const compiled = try self.jit_compiler.compileBlock(block_index, block);
-
-        self.jit_blocks[block_index] = compiled;
-        self.callJit(&compiled);
-    }
-
-    fn jump(self: *Interpreter) !void {
-        // block index is the next "instruction".
-        const block_idx = self.nextOp();
-        self.pc = 0; // start from first instr in the next block
-        const dst_block = &self.blocks[block_idx];
-
-        if (!self.is_jit_enabled) {
-            self.current_block = dst_block;
-            return;
-        }
-
-        // check if the block has been JIT compiled before.
-        if (self.jit_blocks[block_idx]) |*compiled| {
-            self.callJit(compiled);
-            return;
-        }
-
-        if (self.current_block == dst_block) {
-            // self-referencing block. potentially a loop.
-            // JIT compile this.
-            try self.doJit(block_idx);
-            return;
-        }
-
-        // Not a self-referencing block, so do regular execution.
-        self.current_block = dst_block;
-    }
 };
+
+test "interpreter" {
+    var initial_variables = [_]i64{0};
+    var blocks = [_]Block{
+        try Block.init(std.testing.allocator, &[_]u8{ Op(.pushc), 0 }, &[_]i64{1}, &initial_variables),
+    };
+    defer for (&blocks) |*block| {
+        block.deinit();
+    };
+
+    var interpreter = try Interpreter.init(std.testing.allocator, &blocks, true);
+    defer interpreter.deinit();
+    try interpreter.run();
+    try std.testing.expect(interpreter.top() == 1);
+}
+
+test "interpreter loop JIT enabled" {
+    var initial_variables = [_]i64{ 0, 0 };
+    var blocks = [_]Block{
+        try Block.init(std.testing.allocator, &[_]u8{
+            Op(.pushv), 0, // loop start: load i (pops index from stack)
+            Op(.pushc), 0, // load 1000
+            Op(.eq), // if i == 1000
+            Op(.jmp_nz), 1, // exit if equal - jump to exit block
+            Op(.push),   1,
+            Op(.pushv), 1, // x
+            Op(.add), // x + 1
+            Op(.stvar), 1, // x = x + 1
+            Op(.pushv), 0, // i
+            Op(.push), 1, // 1
+            Op(.add), // i + 1
+            Op(.stvar), 0, // i = i + 1
+            Op(.jmp), 0, // loop back to same block
+        }, &[_]i64{10000}, &initial_variables),
+    };
+
+    defer for (&blocks) |*block| {
+        block.deinit();
+    };
+
+    var interpreter = try Interpreter.init(std.testing.allocator, &blocks, true);
+    defer interpreter.deinit();
+    try interpreter.run();
+    try std.testing.expect(interpreter.blocks[0].variables[1] == 10000);
+}
+
+test "interpreter loop JIT disabled" {
+    var initial_variables = [_]i64{ 0, 0 };
+    var blocks = [_]Block{
+        try Block.init(std.testing.allocator, &[_]u8{
+            Op(.pushv), 0, // loop start: load i (pops index from stack)
+            Op(.pushc), 0, // load 1000
+            Op(.eq), // if i == 1000
+            Op(.jmp_nz), 1, // exit if equal - jump to exit block
+            Op(.push),   1,
+            Op(.pushv), 1, // x
+            Op(.add), // x + 1
+            Op(.stvar), 1, // x = x + 1
+            Op(.pushv), 0, // i
+            Op(.push), 1, // 1
+            Op(.add), // i + 1
+            Op(.stvar), 0, // i = i + 1
+            Op(.jmp), 0, // loop back to same block
+        }, &[_]i64{10000}, &initial_variables),
+    };
+
+    defer for (&blocks) |*block| {
+        block.deinit();
+    };
+
+    var interpreter = try Interpreter.init(std.testing.allocator, &blocks, false);
+    defer interpreter.deinit();
+    try interpreter.run();
+    try std.testing.expect(interpreter.blocks[0].variables[1] == 10000);
+}
+
+test "JIT performance comparison" {
+    // JIT enabled measurement
+    var initial_variables_jit = [_]i64{ 0, 0 };
+    var blocks_jit = [_]Block{
+        try Block.init(std.testing.allocator, &[_]u8{
+            Op(.pushv), 0, // loop start: load i (pops index from stack)
+            Op(.pushc), 0, // load 1000
+            Op(.eq), // if i == 1000
+            Op(.jmp_nz), 1, // exit if equal - jump to exit block
+            Op(.push),   1,
+            Op(.pushv), 1, // x
+            Op(.add), // x + 1
+            Op(.stvar), 1, // x = x + 1
+            Op(.pushv), 0, // i
+            Op(.push), 1, // 1
+            Op(.add), // i + 1
+            Op(.stvar), 0, // i = i + 1
+            Op(.jmp), 0, // loop back to same block
+        }, &[_]i64{100000}, &initial_variables_jit),
+    };
+
+    defer for (&blocks_jit) |*block| {
+        block.deinit();
+    };
+
+    var interpreter_jit = try Interpreter.init(std.testing.allocator, &blocks_jit, true);
+    defer interpreter_jit.deinit();
+    // measure
+    const start_jit = std.time.nanoTimestamp();
+    try interpreter_jit.run();
+    const end_jit = std.time.nanoTimestamp();
+    const time_jit = @as(u64, @intCast(end_jit - start_jit));
+
+    // JIT disabled measurement
+    var initial_variables_no_jit = [_]i64{ 0, 0 };
+    var blocks_no_jit = [_]Block{
+        try Block.init(std.testing.allocator, &[_]u8{
+            Op(.pushv), 0, // loop start: load i (pops index from stack)
+            Op(.pushc), 0, // load 1000
+            Op(.eq), // if i == 1000
+            Op(.jmp_nz), 1, // exit if equal - jump to exit block
+            Op(.push),   1,
+            Op(.pushv), 1, // x
+            Op(.add), // x + 1
+            Op(.stvar), 1, // x = x + 1
+            Op(.pushv), 0, // i
+            Op(.push), 1, // 1
+            Op(.add), // i + 1
+            Op(.stvar), 0, // i = i + 1
+            Op(.jmp), 0, // loop back to same block
+        }, &[_]i64{100000}, &initial_variables_no_jit),
+    };
+
+    defer for (&blocks_no_jit) |*block| {
+        block.deinit();
+    };
+
+    var interpreter_no_jit = try Interpreter.init(std.testing.allocator, &blocks_no_jit, false);
+    defer interpreter_no_jit.deinit();
+    const start_no_jit = std.time.nanoTimestamp();
+    try interpreter_no_jit.run();
+    const end_no_jit = std.time.nanoTimestamp();
+    const time_no_jit = @as(u64, @intCast(end_no_jit - start_no_jit));
+
+    // Professional performance report
+    const jit_time_ns = @as(f64, @floatFromInt(time_jit));
+    const no_jit_time_ns = @as(f64, @floatFromInt(time_no_jit));
+    const speedup = no_jit_time_ns / jit_time_ns;
+
+    std.debug.print("\n" ++ "─" ** 50 ++ "\n", .{});
+    std.debug.print("  PERFORMANCE BENCHMARK RESULTS\n", .{});
+    std.debug.print("─" ** 50 ++ "\n", .{});
+    std.debug.print("  Interpreter Mode    │ Execution Time\n", .{});
+    std.debug.print("  ─────────────────── │ ──────────────\n", .{});
+    std.debug.print("  JIT Enabled         │ {d:.2} ns\n", .{jit_time_ns});
+    std.debug.print("  JIT Disabled        │ {d:.2} ns\n", .{no_jit_time_ns});
+    std.debug.print("  ─────────────────── │ ──────────────\n", .{});
+    if (speedup > 1.0) {
+        std.debug.print("  Performance Gain    │ \x1b[32m{d:.2}x\x1b[0m\n", .{speedup});
+    } else {
+        std.debug.print("  Performance Gain    │ {d:.2}x\n", .{speedup});
+    }
+    std.debug.print("─" ** 50 ++ "\n", .{});
+}

@@ -1,4 +1,4 @@
-# TinyJIT
+# TinyJIT - JIT enabled bytecode VM
 
 An educational JIT compiler that emits ARM64 machine code for a simple expression language.
 
